@@ -67,11 +67,13 @@ type traceHandler struct {
 	// bpfTraceCache stores mappings from BPF to user-mode hashes. This allows
 	// avoiding the overhead of re-doing user-mode symbolization of traces that
 	// we have recently seen already.
-	bpfTraceCache *lru.LRU[host.TraceHash, libpf.TraceHash]
+	bpfTraceCache        *lru.LRU[host.TraceHash, libpf.TraceHash]
+	bpfTraceCacheRefresh time.Duration
 
 	// umTraceCache is a LRU set that suppresses unnecessary resends of traces
 	// that we have recently reported to the collector already.
-	umTraceCache *lru.LRU[libpf.TraceHash, libpf.Void]
+	umTraceCache        *lru.LRU[libpf.TraceHash, libpf.Void]
+	umTraceCacheRefresh time.Duration
 
 	// reporter instance to use to send out traces.
 	reporter reporter.TraceReporter
@@ -86,17 +88,21 @@ type traceHandler struct {
 // newTraceHandler creates a new traceHandler
 func newTraceHandler(rep reporter.TraceReporter, traceProcessor TraceProcessor,
 	intervals Times, cacheSize uint32) (*traceHandler, error) {
+	refreshDuration := 60 * time.Minute
+
 	bpfTraceCache, err := lru.New[host.TraceHash, libpf.TraceHash](
 		cacheSize, func(k host.TraceHash) uint32 { return uint32(k) })
 	if err != nil {
 		return nil, err
 	}
+	bpfTraceCache.SetLifetime(refreshDuration)
 
 	umTraceCache, err := lru.New[libpf.TraceHash, libpf.Void](
 		cacheSize, libpf.TraceHash.Hash32)
 	if err != nil {
 		return nil, err
 	}
+	umTraceCache.SetLifetime(refreshDuration)
 
 	metadataWarnInhib, err := lru.New[libpf.PID, libpf.Void](64, libpf.PID.Hash32)
 	if err != nil {
@@ -105,12 +111,14 @@ func newTraceHandler(rep reporter.TraceReporter, traceProcessor TraceProcessor,
 	metadataWarnInhib.SetLifetime(metadataWarnInhibDuration)
 
 	t := &traceHandler{
-		traceProcessor:    traceProcessor,
-		bpfTraceCache:     bpfTraceCache,
-		umTraceCache:      umTraceCache,
-		reporter:          rep,
-		times:             intervals,
-		metadataWarnInhib: metadataWarnInhib,
+		traceProcessor:       traceProcessor,
+		bpfTraceCache:        bpfTraceCache,
+		bpfTraceCacheRefresh: refreshDuration,
+		umTraceCache:         umTraceCache,
+		umTraceCacheRefresh:  refreshDuration,
+		reporter:             rep,
+		times:                intervals,
+		metadataWarnInhib:    metadataWarnInhib,
 	}
 
 	return t, nil
@@ -132,7 +140,7 @@ func (m *traceHandler) HandleTrace(bpfTrace *host.Trace) {
 
 	if !m.reporter.SupportsReportTraceEvent() {
 		// Fast path: if the trace is already known remotely, we just send a counter update.
-		postConvHash, traceKnown := m.bpfTraceCache.Get(bpfTrace.Hash)
+		postConvHash, traceKnown := m.bpfTraceCache.GetAndRefresh(bpfTrace.Hash, m.bpfTraceCacheRefresh)
 		if traceKnown {
 			m.bpfTraceCacheHit++
 			meta.APMServiceName = m.traceProcessor.MaybeNotifyAPMAgent(bpfTrace, postConvHash, 1)
@@ -155,7 +163,7 @@ func (m *traceHandler) HandleTrace(bpfTrace *host.Trace) {
 	m.reporter.ReportCountForTrace(umTrace.Hash, 1, meta)
 
 	// Trace already known to collector by UM hash?
-	if _, known := m.umTraceCache.Get(umTrace.Hash); known {
+	if _, known := m.umTraceCache.GetAndRefresh(umTrace.Hash, m.umTraceCacheRefresh); known {
 		m.umTraceCacheHit++
 		return
 	}
@@ -193,6 +201,10 @@ func Start(ctx context.Context, rep reporter.TraceReporter, traceProcessor Trace
 			case traceUpdate := <-traceInChan:
 				handler.HandleTrace(traceUpdate)
 			case <-metricsTicker.C:
+				handler.bpfTraceCache.PurgeExpired()
+				handler.umTraceCache.PurgeExpired()
+
+				log.Printf("Metrics: bpfTraceCacheSize=%d, umTraceCacheSize=%d, bpfTraceCacheHit=%d, bpfTraceCacheMiss=%d, umTraceCacheHit=%d, umTraceCacheMiss=%d", handler.bpfTraceCache.Len(), handler.umTraceCache.Len(), handler.bpfTraceCacheHit, handler.bpfTraceCacheMiss, handler.umTraceCacheHit, handler.umTraceCacheMiss)
 				handler.collectMetrics()
 			case <-ctx.Done():
 				return
